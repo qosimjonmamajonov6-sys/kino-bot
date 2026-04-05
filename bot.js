@@ -35,7 +35,25 @@ const adminState = {};
 
 async function loadData() {
     try {
-        movies = await fs.readJson(MOVIES_PATH);
+        const rawMovies = await fs.readJson(MOVIES_PATH);
+        movies = {};
+        // Ma'lumotlarni yangi formatga o'tkazish (Migration)
+        for (const code in rawMovies) {
+            const data = rawMovies[code];
+            if (data.episodes) {
+                movies[code] = data;
+            } else {
+                movies[code] = {
+                    name: data.file_name || 'Video',
+                    episodes: [{
+                        file_id: data.file_id,
+                        file_name: data.file_name || 'Video',
+                        date: data.date || new Date().toISOString()
+                    }]
+                };
+            }
+        }
+        console.log('Kinolar muvaffaqiyatli yuklandi! 🎬');
     } catch (err) {
         movies = {};
         await fs.writeJson(MOVIES_PATH, movies);
@@ -116,7 +134,7 @@ function getSubKeyboard() {
     return Markup.inlineKeyboard(buttons, { columns: 1 });
 }
 
-loadData();
+// loadData(); // O'chirildi, oxirida chaqirilmoqda
 
 // Har bir yangi foydalanuvchini ro'yxatga olish
 bot.use(async (ctx, next) => {
@@ -129,12 +147,27 @@ bot.use(async (ctx, next) => {
 
 bot.start(async (ctx) => {
     const userId = ctx.from.id;
+    const payload = ctx.startPayload; // Maxsus havola orqali kelgan kino kodi
+
     if (!adminId) {
         await updateAdmin(userId);
         return ctx.reply(`Tabriklaymiz! Siz ADMIN etib tayinlandingiz. \nSizning ID: ${userId}`);
     }
+
     const sub = await isSubscribed(ctx, userId);
     if (!sub) return ctx.reply('Botdan foydalanish uchun kanalimizga a\'zo bo\'ling:', getSubKeyboard());
+
+    // Agar havola orqali kino kodi kelgan bo'lsa
+    if (payload && movies[payload]) {
+        const movie = movies[payload];
+        const firstEpisode = movie.episodes[0];
+        const keyboard = getEpisodeKeyboard(payload, 0);
+        return ctx.replyWithVideo(firstEpisode.file_id, { 
+            caption: `🎬 Kod: ${payload}${movie.episodes.length > 1 ? `\n🍿 1 - qism` : ''}\n❤️ Yoqimli tomosha!`,
+            ...(keyboard ? keyboard : {})
+        });
+    }
+
     ctx.reply('Xush kelibsiz! Kino kodini yuboring. 🍿');
 });
 
@@ -143,6 +176,7 @@ function getAdminKeyboard() {
     return Markup.inlineKeyboard([
         [Markup.button.callback('📊 Statistika', 'admin_stats'), Markup.button.callback('📢 Xabar yuborish', 'admin_broadcast')],
         [Markup.button.callback('📂 Zaxira (GitHub)', 'admin_backup'), Markup.button.callback('🗑 Kino o\'chirish', 'admin_delete')],
+        [Markup.button.callback('📢 Kanalga ulashish', 'admin_share_channel')],
     ]);
 }
 
@@ -183,6 +217,15 @@ bot.action('admin_delete', async (ctx) => {
     adminState[ctx.from.id] = { step: 'awaiting_delete_code' };
     await ctx.answerCbQuery();
     await ctx.reply('🗑 O\'chirmoqchi bo\'lgan kino kodini yuboring:', 
+        Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
+    );
+});
+
+bot.action('admin_share_channel', async (ctx) => {
+    if (ctx.from.id.toString() !== adminId) return;
+    adminState[ctx.from.id] = { step: 'awaiting_share_code' };
+    await ctx.answerCbQuery();
+    await ctx.reply('📢 Kanalga reklama sifatida chiqarmoqchi bo\'lgan kino kodini yuboring:', 
         Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
     );
 });
@@ -231,8 +274,67 @@ bot.on('message', async (ctx, next) => {
         );
     }
 
+    if (state.step === 'awaiting_share_code') {
+        const code = ctx.message.text ? ctx.message.text.trim() : null;
+        if (!code || !movies[code]) {
+            return ctx.reply('❌ Bunday kodli kino topilmadi. Qayta yuboring yoki bekor qiling:', 
+                Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
+            );
+        }
+        
+        adminState[userId] = { step: 'awaiting_share_image', code: code };
+        return ctx.reply(`📸 Endi '${movies[code].name}' uchun kanalga chiqadigan **rasmni (poster)** yuboring:`,
+            Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
+        );
+    }
+
+    if (state.step === 'awaiting_share_image') {
+        const photo = ctx.message.photo ? ctx.message.photo[ctx.message.photo.length - 1].file_id : null;
+        if (!photo) {
+            return ctx.reply('❌ Iltimos, reklama uchun rasm yuboring:', 
+                Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
+            );
+        }
+
+        const code = state.code;
+        delete adminState[userId];
+        await shareToChannel(code, photo, ctx);
+        return;
+    }
+
+    // Agar step noaniq bo'lsa, keyingi handlerga o'tish
     return next();
 });
+
+// Kanalga share qilish funksiyasi
+async function shareToChannel(code, photoFileId, ctx) {
+    const movie = movies[code];
+    const channelId = channels[0]; // Reklama @ANIMELAR_1312 kanaliga ketadi
+    console.log(`Kanalga rasm bilan post yuborish: Kod=${code}, Kanal=${channelId}`);
+
+    if (!channelId) return ctx.reply('❌ Kanal sozlanmagan! (.env faylda CHANNELS qismini tekshiring)');
+
+    const botUsername = ctx.botInfo.username;
+    const watchLink = `https://t.me/${botUsername}?start=${code}`;
+
+    const caption = `🎬 *${movie.name}*\n\n🔥 Yangi seryal/kino botga qo'shildi!\n🔎 Kod: \`${code}\` \n\n🍿 Marhamat, pastdagi tugmani bosib tomosha qiling:`;
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.url('Tomosha qilish 🍿', watchLink)]
+    ]);
+
+    try {
+        await ctx.telegram.sendPhoto(channelId, photoFileId, {
+            caption: caption,
+            parse_mode: 'Markdown',
+            ...keyboard
+        });
+        ctx.reply('✅ Kanalga reklama rasm bilan muvaffaqiyatli yuborildi!');
+    } catch (error) {
+        console.error('Kanalga rasm yuborishda xatolik:', error);
+        ctx.reply(`❌ Kanalga yuborishda xatolik yuz berdi: ${error.message}\n\nEslatma: Bot kanalizda admin ekanligini tekshiring.`);
+    }
+}
 
 // Deletion Confirmation Handler
 bot.action(/^confirm_del_(.+)$/, async (ctx) => {
@@ -274,24 +376,122 @@ bot.on(['video', 'document'], async (ctx) => {
     if (!adminId || ctx.from.id.toString() !== adminId) return;
     const file = ctx.message.video || (ctx.message.document && ctx.message.document.mime_type.startsWith('video') ? ctx.message.document : null);
     if (!file) return;
+    
     let cap = ctx.message.caption ? ctx.message.caption.trim() : null;
-    let code = (cap && !isNaN(cap)) ? cap : (Object.keys(movies).length > 0 ? (Math.max(...Object.keys(movies).map(Number)) + 1).toString() : "100");
-    movies[code] = { file_id: file.file_id, name: file.file_name || 'Video', date: new Date().toISOString() };
+    let code = (cap && !isNaN(cap)) ? cap : null;
+
+    if (!code) {
+        // Agar caption bo'lmasa yoki son bo'lmasa, yangi kod yaratamiz
+        code = (Object.keys(movies).length > 0 ? (Math.max(...Object.keys(movies).map(Number)) + 1).toString() : "100");
+    }
+
+    const newEpisode = { 
+        file_id: file.file_id, 
+        file_name: file.file_name || 'Video', 
+        date: new Date().toISOString() 
+    };
+
+    if (movies[code]) {
+        movies[code].episodes.push(newEpisode);
+        ctx.reply(`Mavjud ${code}-kodga yangi qism qo'shildi! ✅ \nJami qismlar: ${movies[code].episodes.length}`);
+    } else {
+        movies[code] = { 
+            name: file.file_name || 'Video', 
+            episodes: [newEpisode] 
+        };
+        ctx.reply(`Yangi kino saqlandi! ✅ Kod: ${code}`);
+    }
+
     await saveData();
-    ctx.reply(`Saqlandi! ✅ Kod: ${code}`);
     pushToGithub().catch(console.error);
+});
+
+// Qismlar uchun klaviatura yaratish
+function getEpisodeKeyboard(code, currentEp) {
+    const movie = movies[code];
+    if (!movie || movie.episodes.length <= 1) return null;
+
+    const buttons = [];
+    let row = [];
+    movie.episodes.forEach((_, index) => {
+        const label = (index === currentEp) ? `· ${index + 1} ·` : `${index + 1}`;
+        row.push(Markup.button.callback(label, `ep_${code}_${index}`));
+        if (row.length === 5) {
+            buttons.push(row);
+            row = [];
+        }
+    });
+    if (row.length > 0) buttons.push(row);
+    return Markup.inlineKeyboard(buttons);
+}
+
+// Qismni alohida xabar qilib yuborish
+bot.action(/^ep_(.+)_(.+)$/, async (ctx) => {
+    const code = ctx.match[1];
+    const epIndex = parseInt(ctx.match[2]);
+    
+    if (!movies[code] || !movies[code].episodes[epIndex]) {
+        return ctx.answerCbQuery('Qism topilmadi! ❌');
+    }
+
+    const movie = movies[code];
+    const episode = movie.episodes[epIndex];
+    const keyboard = getEpisodeKeyboard(code, epIndex);
+
+    try {
+        await ctx.answerCbQuery(`${epIndex + 1}-qism yuborilmoqda...`);
+        await ctx.replyWithVideo(episode.file_id, {
+            caption: `🎬 Kod: ${code}\n🍿 Qism: ${epIndex + 1}\n❤️ Yoqimli tomosha!`,
+            ...(keyboard ? keyboard : {})
+        });
+    } catch (e) {
+        console.error('Episode send error:', e);
+        await ctx.reply('❌ Videoni yuborishda xatolik yuz berdi.');
+    }
 });
 
 // Kino qidirish (User)
 bot.on('text', async (ctx) => {
     const code = ctx.message.text.trim();
     if (isNaN(code)) return ctx.reply('Faqat kino kodini yuboring. 🔎');
-    if (!(await isSubscribed(ctx, ctx.from.id))) return ctx.reply('Kanalga a\'zo bo\'ling:', getSubKeyboard());
+    
+    if (!(await isSubscribed(ctx, ctx.from.id))) {
+        return ctx.reply('Botdan foydalanish uchun kanalimizga a\'zo bo\'ling:', getSubKeyboard());
+    }
+
     if (movies[code]) {
-        await ctx.replyWithVideo(movies[code].file_id, { caption: `🎬 Kod: ${code}\n❤️ Yoqimli tomosha!` });
-    } else { ctx.reply('Kechirasiz, bunday kodli kino topilmadi. ❌'); }
+        const movie = movies[code];
+        const firstEpisode = movie.episodes[0];
+        const keyboard = getEpisodeKeyboard(code, 0);
+
+        await ctx.replyWithVideo(firstEpisode.file_id, { 
+            caption: `🎬 Kod: ${code}${movie.episodes.length > 1 ? `\n🍿 1 - qism` : ''}\n❤️ Yoqimli tomosha!`,
+            ...(keyboard ? keyboard : {})
+        });
+    } else { 
+        ctx.reply('Kechirasiz, bunday kodli kino topilmadi. ❌'); 
+    }
 });
 
-bot.launch().then(() => console.log('Kino Bot ishga tushdi! 🚀'));
+// Xatoliklarni ushlash (Bot to'xtab qolmasligi uchun)
+bot.catch((err, ctx) => {
+    console.error(`Xatolik yuz berdi (${ctx.updateType}):`, err);
+});
+
+// Botni ishga tushirish funksiyasi (xatolik bo'lsa qayta urinadi)
+async function startBot() {
+    try {
+        await loadData();
+        await bot.launch();
+        console.log('Kino Bot ishga tushdi! 🚀');
+    } catch (err) {
+        console.error('Botni ishga tushirishda xatolik yuz berdi:', err.message);
+        console.log('5 soniyadan keyin qayta urunib ko\'riladi...');
+        setTimeout(startBot, 5000);
+    }
+}
+
+startBot();
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
