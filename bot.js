@@ -30,6 +30,9 @@ let users = [];
 let adminId = process.env.ADMIN_ID || null;
 const channels = process.env.CHANNELS ? process.env.CHANNELS.split(',').map(c => c.trim()) : [];
 
+// Admin holatini kuzatish uchun
+const adminState = {};
+
 async function loadData() {
     try {
         movies = await fs.readJson(MOVIES_PATH);
@@ -135,30 +138,116 @@ bot.start(async (ctx) => {
     ctx.reply('Xush kelibsiz! Kino kodini yuboring. 🍿');
 });
 
-// Admin Statistika
+// Admin Keyboard
+function getAdminKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('📊 Statistika', 'admin_stats'), Markup.button.callback('📢 Xabar yuborish', 'admin_broadcast')],
+        [Markup.button.callback('📂 Zaxira (GitHub)', 'admin_backup'), Markup.button.callback('🗑 Kino o\'chirish', 'admin_delete')],
+    ]);
+}
+
+// Admin Panel Command
 bot.command('admin', (ctx) => {
     if (ctx.from.id.toString() !== adminId) return;
-    const msg = `📊 *Statistika*\n\n🎬 Kinolar: ${Object.keys(movies).length} ta\n👥 Userlar: ${users.length} ta\n\nZaxira: /backup`;
-    ctx.replyWithMarkdown(msg);
+    ctx.reply('🛠 *Admin Paneli* \n\nQuyidagi amallardan birini tanlang:', {
+        parse_mode: 'Markdown',
+        ...getAdminKeyboard()
+    });
 });
 
-// Manual Backup
-bot.command('backup', async (ctx) => {
+// Admin Actions
+bot.action('admin_stats', async (ctx) => {
     if (ctx.from.id.toString() !== adminId) return;
+    const msg = `📊 *Statistika*\n\n🎬 Kinolar soni: ${Object.keys(movies).length} ta\n👥 Foydalanuvchilar: ${users.length} ta`;
+    await ctx.answerCbQuery();
+    await ctx.replyWithMarkdown(msg, getAdminKeyboard());
+});
+
+bot.action('admin_backup', async (ctx) => {
+    if (ctx.from.id.toString() !== adminId) return;
+    await ctx.answerCbQuery('Zaxiralash boshlandi...');
     await pushToGithub(ctx);
 });
 
-// Xabar tarqatish
-bot.command('broadcast', async (ctx) => {
+bot.action('admin_broadcast', async (ctx) => {
     if (ctx.from.id.toString() !== adminId) return;
-    const msg = ctx.message.text.split(' ').slice(1).join(' ');
-    if (!msg) return ctx.reply('Xabar matnini yozing. Masalan: /broadcast Salom!');
-    ctx.reply(`Tarqatilmoqda... (${users.length} ta user)`);
-    let count = 0;
-    for (const id of users) {
-        try { await ctx.telegram.sendMessage(id, msg); count++; } catch (e) {}
+    adminState[ctx.from.id] = { step: 'awaiting_broadcast' };
+    await ctx.answerCbQuery();
+    await ctx.reply('📢 Tarqatmoqchi bo\'lgan xabaringizni yuboring (Matn, Rasm, Video yoki Fayl bo\'lishi mumkin):', 
+        Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
+    );
+});
+
+bot.action('admin_delete', async (ctx) => {
+    if (ctx.from.id.toString() !== adminId) return;
+    adminState[ctx.from.id] = { step: 'awaiting_delete_code' };
+    await ctx.answerCbQuery();
+    await ctx.reply('🗑 O\'chirmoqchi bo\'lgan kino kodini yuboring:', 
+        Markup.inlineKeyboard([Markup.button.callback('❌ Bekor qilish', 'cancel_admin')])
+    );
+});
+
+bot.action('cancel_admin', async (ctx) => {
+    if (ctx.from.id.toString() !== adminId) return;
+    delete adminState[ctx.from.id];
+    await ctx.answerCbQuery('Bekor qilindi');
+    await ctx.editMessageText('Amal bekor qilindi. 🛠 Admin Paneli:', getAdminKeyboard());
+});
+
+// Admin state-based message handler
+bot.on('message', async (ctx, next) => {
+    const userId = ctx.from.id;
+    const state = adminState[userId];
+
+    if (!state || userId.toString() !== adminId) return next();
+
+    if (state.step === 'awaiting_broadcast') {
+        delete adminState[userId];
+        ctx.reply(`📢 Xabar ${users.length} ta foydalanuvchiga yuborilmoqda...`);
+        let successCount = 0;
+        for (const id of users) {
+             try {
+                await ctx.telegram.copyMessage(id, ctx.chat.id, ctx.message.message_id);
+                successCount++;
+             } catch (e) {
+                console.error(`Failed to send to ${id}:`, e.message);
+             }
+        }
+        return ctx.reply(`✅ Xabar muvaffaqiyatli tarqatildi! \nQabul qildi: ${successCount} ta foydalanuvchi.`);
     }
-    ctx.reply(`Tayyor! ✅ ${count} ta userga yetkazildi.`);
+
+    if (state.step === 'awaiting_delete_code') {
+        const code = ctx.message.text ? ctx.message.text.trim() : null;
+        if (!code || !movies[code]) {
+            return ctx.reply('❌ Bunday kodli kino topilmadi. Qayta yuboring yoki bekor qiling:');
+        }
+        
+        adminState[userId] = { step: 'confirm_delete', code: code };
+        return ctx.reply(`❓ Haqiqatan ham '${movies[code].name}' (kod: ${code}) kinosini o'chirib tashlamoqchimisiz?`,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Ha, o\'chirilsin', `confirm_del_${code}`)],
+                [Markup.button.callback('❌ Yo\'q, bekor qilish', 'cancel_admin')]
+            ])
+        );
+    }
+
+    return next();
+});
+
+// Deletion Confirmation Handler
+bot.action(/^confirm_del_(.+)$/, async (ctx) => {
+    if (ctx.from.id.toString() !== adminId) return;
+    const code = ctx.match[1];
+    if (movies[code]) {
+        delete movies[code];
+        await saveData();
+        await ctx.answerCbQuery('Muvaffaqiyatli o\'chirildi');
+        await ctx.editMessageText(`✅ Kod '${code}' muvaffaqiyatli o'chirildi.`, getAdminKeyboard());
+        pushToGithub().catch(console.error);
+    } else {
+        await ctx.answerCbQuery('Xatolik: Kino topilmadi');
+    }
+    delete adminState[ctx.from.id];
 });
 
 // Tekshirish tugmasi
